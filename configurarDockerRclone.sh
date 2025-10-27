@@ -1,12 +1,9 @@
 #!/bin/bash
 
-# Script de setup: Crea usuario tux (si no existe), asigna sudo, crea directorio docker, y configura rclone.conf y docker-compose.yml COMO tux
-# Uso: ./setup-tux-configs.sh  (ejecutar como root; te pedirá contraseña ANTES de crear tux si no existe, y luego configs interactivas)
-# Al final, regresa a root.
-# Verificación de errores: Se agregan chequeos de exit code después de comandos críticos. Si falla, muestra error y sale.
-# Validación de entrada: Verifica que se ejecute como root, contraseña mínima de 8 chars, configs no vacíos.
-# Ajuste: Si el usuario 'tux' ya existe, omite la creación y configuración de contraseña/grupo sudo.
-# Nota: Siempre pide configs para permitir sobrescritura/actualización. Ejecuta docker compose up -d al final.
+# Script de instalación: Instala/actualiza Docker y rclone como usuario actual (ejecutar como tux o root con sudo)
+# Uso: ./install-docker-rclone.sh  (ejecutar como tux; usa sudo para privilegios)
+# Verificación: Salta instalación si ya existe, pero actualiza paquetes y configs si procede.
+# Nota: No maneja creación de usuario tux, directorio docker, ni configs de rclone/docker-compose.
 
 set -u  # Trata variables no definidas como error
 
@@ -18,193 +15,179 @@ check_error() {
     fi
 }
 
-# Función para validar contraseña (mínimo 8 caracteres)
-validate_password() {
-    local pass="$1"
-    if [ ${#pass} -lt 8 ]; then
-        echo "ERROR: La contraseña debe tener al menos 8 caracteres."
-        return 1
-    fi
-    return 0
-}
-
-# Función para validar y/n input
-validate_yn() {
-    local input="$1"
-    if [[ ! "$input" =~ ^[YyNn]$ ]]; then
-        echo "ERROR: Entrada inválida. Debe ser 'y' o 'n'."
-        return 1
-    fi
-    return 0
-}
-
 # ========================================
-# VALIDACIÓN INICIAL: Verificar que se ejecute como root
+# VALIDACIÓN INICIAL: Verificar dependencias básicas
 # ========================================
-if [ "$EUID" -ne 0 ]; then
-    echo "ERROR: Este script debe ejecutarse como root (use sudo)."
-    exit 1
-fi
-
-# ========================================
-# PASO INICIAL: Verificar si usuario 'tux' ya existe
-# ========================================
-TUX_EXISTS=false
-if id "tux" &>/dev/null; then
-    echo "Usuario 'tux' ya existe. Omitiendo creación."
-    TUX_EXISTS=true
+if [ "$EUID" -eq 0 ]; then
+    echo "Ejecutando como root. Usando sudo innecesario."
+    USE_SUDO=""
 else
-    # Solicitar contraseña ANTES de crear el usuario
-    echo "El usuario 'tux' no existe. Se creará ahora."
-    echo "Ingrese la contraseña para 'tux' (mínimo 8 caracteres):"
-    read -s PASSWORD
-    echo  # Nueva línea para continuar limpio
-
-    if [ -z "$PASSWORD" ]; then
-        echo "ERROR: La contraseña no puede estar vacía."
-        exit 1
-    fi
-
-    if ! validate_password "$PASSWORD"; then
-        exit 1
-    fi
-
-    echo "Creando usuario 'tux' de forma no interactiva..."
-    useradd -m -s /bin/bash tux
-    check_error
-
-    echo "Seteando contraseña para 'tux'..."
-    echo "tux:$PASSWORD" | chpasswd
-    check_error
+    USE_SUDO="sudo"
+    echo "Ejecutando como usuario no-root. Usando sudo para comandos privilegiados."
 fi
 
-# Agregar a grupo sudo solo si no está ya
-if ! groups tux | grep -q sudo; then
-    echo "Agregando 'tux' al grupo sudo..."
-    usermod -aG sudo tux
+# ========================================
+# GRUPO 0: Actualizar paquetes del sistema (siempre, para posibles actualizaciones)
+# ========================================
+echo "Actualizando paquetes del sistema..."
+$USE_SUDO apt-get update
+check_error
+$USE_SUDO apt-get upgrade -y
+check_error
+
+# ========================================
+# GRUPO 1: Actualizar paquetes e instalar dependencias básicas para repositorios
+# ========================================
+# Este grupo actualiza la lista de paquetes y instala herramientas necesarias para manejar claves GPG y descargas seguras.
+# ca-certificates asegura conexiones HTTPS válidas; curl para descargar el key de Docker.
+echo "Verificando dependencias básicas (ca-certificates y curl)..."
+if ! dpkg -l | grep -q ca-certificates || ! dpkg -l | grep -q curl; then
+    echo "Instalando dependencias..."
+    $USE_SUDO apt-get install -y ca-certificates curl
     check_error
 else
-    echo "'tux' ya está en el grupo sudo. Omitiendo."
+    echo "Dependencias ya instaladas. Omitiendo."
 fi
 
 # ========================================
-# CONFIGURACIÓN DE SUDO NOPASSWD PARA TUX (temporal para prompts interactivos en su -c)
+# GRUPO 2: Configurar directorio de keyrings y descargar clave GPG de Docker
 # ========================================
-echo "Configurando sudo sin contraseña para 'tux' (temporal para setup)..."
-echo "tux ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tux
-check_error
-chmod 0440 /etc/sudoers.d/tux
-check_error
-echo "Configuración de sudoers aplicada."
-
-# ========================================
-# PASO PRINCIPAL: Configurar directorio, archivos y ejecutar compose como 'tux'
-# ========================================
-echo "Ejecutando configuración de directorio y archivos como usuario 'tux'..."
-su - tux -c '
-set -u  # Trata variables no definidas como error
-
-# Función para verificar errores (dentro de su)
-check_error() {
-    if [ $? -ne 0 ]; then
-        echo "ERROR: El comando anterior falló. Abortando script."
-        exit 1
-    fi
-}
-
-# ========================================
-# GRUPO 1: Crear directorio docker en /home/tux/ (como tux)
-# ========================================
-echo "Creando directorio /home/tux/docker si no existe..."
-mkdir -p ~/docker
-check_error
-
-# ========================================
-# GRUPO 2: Configurar archivo de rclone.conf (como tux) - SIEMPRE PIDE PARA ACTUALIZAR
-# ========================================
-# Este grupo solicita interactivamente el texto completo del archivo de configuración de rclone.
-# Usa cat para leer multi-línea: pega el contenido completo y termina con Ctrl+D (EOF) en una línea nueva.
-# Luego, crea el directorio ~/.config/rclone si no existe y guarda el config en rclone.conf.
-echo "Pegue el texto completo del archivo de configuración de rclone (copie y pegue todo el contenido). Esto sobrescribirá el existente."
-echo "Cuando termine, presione Enter en una línea nueva y luego Ctrl+D (EOF) para continuar."
-RCLONE_CONFIG=$(cat)
-if [ -z "$RCLONE_CONFIG" ]; then
-    echo "ERROR: El archivo de configuración de rclone está vacío."
-    exit 1
-fi
-mkdir -p ~/.config/rclone
-check_error
-echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-check_error
-echo "Archivo de configuración de rclone actualizado en ~/.config/rclone/rclone.conf"
-
-# ========================================
-# GRUPO 3: Configurar archivo de docker-compose.yml (como tux) - SIEMPRE PIDE PARA ACTUALIZAR
-# ========================================
-# Este grupo solicita interactivamente el texto completo del archivo de configuración de docker-compose.
-# Usa cat para leer multi-línea: pega el contenido completo y termina con Ctrl+D (EOF) en una línea nueva.
-# Luego, guarda el config en ~/docker/docker-compose.yml.
-echo "Pegue el texto completo del archivo de configuración de docker-compose.yml (copie y pegue todo el contenido). Esto sobrescribirá el existente."
-echo "Cuando termine, presione Enter en una línea nueva y luego Ctrl+D (EOF) para continuar."
-DOCKER_COMPOSE_CONFIG=$(cat)
-if [ -z "$DOCKER_COMPOSE_CONFIG" ]; then
-    echo "ERROR: El archivo de configuración de docker-compose.yml está vacío."
-    exit 1
-fi
-echo "$DOCKER_COMPOSE_CONFIG" > ~/docker/docker-compose.yml
-check_error
-echo "Archivo de configuración de docker-compose actualizado en ~/docker/docker-compose.yml"
-
-# ========================================
-# GRUPO 4: Ejecutar docker compose up -d en el directorio docker (como tux)
-# ========================================
-# Este grupo cambia al directorio ~/docker y ejecuta docker compose up -d para iniciar los servicios en background.
-# Usa sudo para permisos de Docker (asumiendo que tux no está en el grupo docker aún).
-echo "¿Deseas ejecutar docker compose up -d ahora? (y/n): "
-read -r RUN_COMPOSE
-if [[ "$RUN_COMPOSE" =~ ^[Yy]$ ]]; then
-    echo "Ejecutando docker compose up -d en ~/docker (reiniciará si hay cambios)..."
-    cd ~/docker
+# Este grupo crea un directorio seguro para claves GPG de repositorios de terceros y descarga la clave oficial de Docker.
+# -m 0755: permisos de directorio (dueño escribe, grupo/otros leen/ejecutan).
+# -fsSL: flags de curl para fail silent, show errors, location follow, silent.
+# chmod a+r: hace la clave legible por todos (necesario para apt usar signed-by).
+echo "Verificando clave GPG de Docker..."
+if [ ! -f /etc/apt/keyrings/docker.asc ]; then
+    echo "Configurando keyrings y descargando clave GPG de Docker..."
+    $USE_SUDO install -m 0755 -d /etc/apt/keyrings
     check_error
-    sudo docker compose up -d
+    $USE_SUDO curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     check_error
-    echo "Servicios de Docker Compose iniciados/actualizados."
+    $USE_SUDO chmod a+r /etc/apt/keyrings/docker.asc
+    check_error
 else
-    echo "Omitiendo ejecución de docker compose up -d."
-fi
-
-echo "Configuración completada como usuario '\''tux'\''!"
-'
-
-# Verificar si su falló
-if [ $? -ne 0 ]; then
-    echo "ERROR: La ejecución como usuario 'tux' falló."
-    exit 1
+    echo "Clave GPG de Docker ya configurada. Omitiendo."
 fi
 
 # ========================================
-# PASO FINAL: Opcional - Agregar 'tux' al grupo docker para usar Docker sin sudo (como root)
+# GRUPO 3: Agregar repositorio oficial de Docker a las fuentes de APT
 # ========================================
-echo "¿Deseas agregar 'tux' al grupo docker para que pueda usar Docker sin sudo? (y/n): "
-read -r ADD_TO_DOCKER_GROUP
-if ! validate_yn "$ADD_TO_DOCKER_GROUP"; then
-    exit 1
-fi
-
-if [[ "$ADD_TO_DOCKER_GROUP" =~ ^[Yy]$ ]]; then
-    # Verificar si ya está en el grupo docker
-    if ! groups tux | grep -q docker; then
-        echo "Agregando 'tux' al grupo docker..."
-        usermod -aG docker tux
-        check_error
-        echo "Usuario 'tux' agregado al grupo docker. Nota: 'tux' debe reloguear (cerrar sesión y volver a entrar) para que los cambios surtan efecto."
-    else
-        echo "'tux' ya está en el grupo docker. Omitiendo."
-    fi
+# Este grupo genera dinámicamente la línea del repositorio Docker basada en la arquitectura (amd64/arm64/etc.) y la versión de Ubuntu.
+# $(dpkg --print-architecture): detecta arch automáticamente.
+# CODENAME: se computa explícitamente aquí para expansión correcta.
+# signed-by=/etc/apt/keyrings/docker.asc: usa la clave para verificar paquetes.
+# tee > /dev/null: escribe al archivo sin output en consola.
+# Nota: $USE_SUDO tee para escribir en /etc/.
+CODENAME=$( . /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME} )
+echo "Verificando repositorio de Docker..."
+if [ ! -f /etc/apt/sources.list.d/docker.list ]; then
+    echo "Agregando repositorio de Docker con codename: $CODENAME..."
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $CODENAME stable" | \
+      $USE_SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
+    check_error
+    $USE_SUDO apt-get update
+    check_error
 else
-    echo "No se agregó 'tux' al grupo docker. Puedes usar Docker con sudo."
+    echo "Repositorio de Docker ya agregado. Actualizando paquetes..."
+    $USE_SUDO apt-get update
+    check_error
 fi
 
-echo "Script de setup finalizado. Ahora puedes conectarte como 'tux'."
-# Nota: Para remover NOPASSWD después del setup, borra /etc/sudoers.d/tux manualmente si es necesario.
-# Recomendación: Ejecuta ./configurarDockerRclone.sh como tux para instalar/actualizar Docker y rclone si no lo has hecho.
+# ========================================
+# GRUPO 4: Actualizar paquetes nuevamente e instalar componentes de Docker
+# ========================================
+# Este grupo refresca la lista de paquetes (para incluir el nuevo repo) e instala Docker CE y sus plugins.
+# -y: asume yes a prompts.
+# Paquetes: docker-ce (motor), docker-ce-cli (CLI), containerd.io (runtime), docker-buildx-plugin (buildx), docker-compose-plugin (compose v2).
+echo "Verificando instalación de Docker..."
+if ! dpkg -l | grep -q docker-ce; then
+    echo "Instalando Docker..."
+    $USE_SUDO apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    check_error
+else
+    echo "Docker ya instalado. Actualizando si es necesario..."
+    $USE_SUDO apt-get -y upgrade docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    check_error
+fi
+
+# ========================================
+# GRUPO 5: Iniciar el servicio de Docker si no está activo
+# ========================================
+# Este grupo verifica e inicia el daemon de Docker.
+# start: inicia si no corre; no falla si ya está activo (a diferencia de restart).
+echo "Verificando servicio de Docker..."
+if ! $USE_SUDO systemctl is-active --quiet docker; then
+    echo "Iniciando servicio de Docker..."
+    $USE_SUDO systemctl start docker
+    check_error
+else
+    echo "Servicio de Docker ya activo. Omitiendo."
+fi
+
+# ========================================
+# GRUPO 6: Instalar rclone
+# ========================================
+# Este grupo descarga e instala rclone usando el script oficial de instalación.
+# curl descarga el script de instalación; | $USE_SUDO bash lo ejecuta con privilegios.
+# Nota: Esto instala rclone globalmente.
+echo "Verificando instalación de rclone..."
+if ! command -v rclone >/dev/null 2>&1; then
+    echo "Instalando rclone..."
+    curl https://rclone.org/install.sh | $USE_SUDO bash
+    check_error
+else
+    echo "rclone ya instalado. Omitiendo."
+fi
+
+# ========================================
+# GRUPO 7: Instalar sops y age (para encriptación de YAML con sops)
+# ========================================
+# Este grupo instala sops (binario directo) y age (paquete APT) si no existen.
+# sops: Descarga la versión estable desde GitHub; mv a /usr/local/bin para PATH global.
+# age: Disponible en repos de Ubuntu; asegura encriptación age para sops.
+echo "Verificando instalación de sops y age..."
+if ! command -v sops >/dev/null 2>&1; then
+    echo "Instalando sops..."
+    $USE_SUDO curl -LO https://github.com/mozilla/sops/releases/download/v3.8.1/sops-v3.8.1.linux.amd64
+    check_error
+    $USE_SUDO mv sops-v3.8.1.linux.amd64 /usr/local/bin/sops
+    check_error
+    $USE_SUDO chmod +x /usr/local/bin/sops
+    check_error
+else
+    echo "sops ya instalado. Omitiendo."
+fi
+if ! command -v age >/dev/null 2>&1; then
+    echo "Instalando age..."
+    $USE_SUDO apt-get update
+    check_error
+    $USE_SUDO apt-get install -y age
+    check_error
+else
+    echo "age ya instalado. Omitiendo."
+fi
+
+# ========================================
+# GRUPO 8: Descargar script de configuración adicional para Docker y rclone
+# ========================================
+# Este grupo descarga el script configurarDockerRclone.sh desde el repositorio GitHub y lo hace ejecutable.
+# Se descarga en el directorio actual (ejecutar como tux para que quede en ~tux).
+# Verifica si ya existe para evitar re-descargas innecesarias.
+echo "Verificando descarga del script configurarDockerRclone.sh..."
+if [ ! -f configurarDockerRclone.sh ]; then
+    echo "Descargando script de configuración adicional..."
+    $USE_SUDO curl -LO https://raw.githubusercontent.com/leosuaar/test/main/configurarDockerRclone.sh -o configurarDockerRclone.sh
+    check_error
+    $USE_SUDO mv configurarDockerRclone.sh /usr/local/bin/configurarsistema
+    check_error
+    chmod +x /usr/local/bin/configurarsistema
+    check_error
+    echo "Script descargado y hecho ejecutable. Puedes ejecutarlo manualmente después (ej: ./configurarDockerRclone.sh)."
+else
+    echo "Script configurarDockerRclone.sh ya existe. Omitiendo descarga."
+fi
+
+echo "Instalación/actualización de Docker, rclone, sops y age completada!"
+echo "Nota: Para usar Docker sin sudo, agrega el usuario actual al grupo docker (ej: sudo usermod -aG docker $USER) y reloguea."
