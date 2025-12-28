@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Script de setup: Crea usuario tux (si no existe), asigna sudo, crea directorio docker, y configura rclone.conf y docker-compose.yml COMO tux
+# Script de setup v2: Crea usuario tux (si no existe), asigna sudo, crea directorio docker, y configura rclone.conf y docker-compose.yml COMO tux
 # Uso: ./setup-tux-configs.sh  (ejecutar como root; te pedirá contraseña ANTES de crear tux si no existe, y luego configs interactivas)
 # Al final, regresa a root.
 # Verificación de errores: Se agregan chequeos de exit code después de comandos críticos. Si falla, muestra error y sale.
 # Validación de entrada: Verifica que se ejecute como root, contraseña mínima de 8 chars, configs no vacíos.
 # Ajuste: Si el usuario 'tux' ya existe, omite la creación y configuración de contraseña/grupo sudo.
-# Nota: Siempre pide configs para permitir sobrescritura/actualización. Ejecuta docker compose up -d al final.
+# Nota: Siempre pide configs para permitir sobrescritura/actualización. La ejecución de docker compose up -d se mueve al final como último paso.
+# FIX 2025-11-02 v2: Pre-clean Docker down + chown/chmod específico en jellyfin/config; limpia .partials; verificación final de ownership en subdirs.
 
 set -u  # Trata variables no definidas como error
 
@@ -47,15 +48,15 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ========================================
-# PASO INICIAL: Verificar si usuario 'tux' ya existe
+# PASO INICIAL: Verificar si usuario 'tux' ya existe (aseguramos que exista antes de proceder)
 # ========================================
 TUX_EXISTS=false
 if id "tux" &>/dev/null; then
-    echo "Usuario 'tux' ya existe. Omitiendo creación."
+    echo "Usuario 'tux' ya existe. Procediendo con configuración."
     TUX_EXISTS=true
 else
     # Solicitar contraseña ANTES de crear el usuario
-    echo "El usuario 'tux' no existe. Se creará ahora."
+    echo "El usuario 'tux' no existe. Se creará ahora para evitar problemas en pasos posteriores."
     echo "Ingrese la contraseña para 'tux' (mínimo 8 caracteres):"
     read -s PASSWORD
     echo  # Nueva línea para continuar limpio
@@ -85,6 +86,54 @@ if ! groups tux | grep -q sudo; then
     check_error
 else
     echo "'tux' ya está en el grupo sudo. Omitiendo."
+fi
+
+# ========================================
+# PRE-FIX: Limpieza agresiva de /home/tux/docker si existe
+# ========================================
+DOCKER_DIR="/home/tux/docker"
+JELLYFIN_CONFIG="$DOCKER_DIR/jellyfin/config"
+
+if [ -d "$DOCKER_DIR" ]; then
+    echo "Detectado $DOCKER_DIR. Iniciando pre-clean..."
+    
+    # Detener Docker si compose.yml existe (evita locks)
+    if [ -f "$DOCKER_DIR/docker-compose.yml" ]; then
+        echo "Deteniendo servicios Docker temporalmente..."
+        su - tux -c "cd ~/docker && docker compose down || true"
+        check_error
+    fi
+    
+    # Forzar ownership full
+    echo "Forzando chown -R tux:tux en $DOCKER_DIR..."
+    chown -R tux:tux "$DOCKER_DIR"
+    check_error
+    
+    # Permisos específicos para jellyfin/config (más granulares)
+    if [ -d "$JELLYFIN_CONFIG" ]; then
+        echo "Aplicando permisos granulares a $JELLYFIN_CONFIG..."
+        find "$JELLYFIN_CONFIG" -type d -exec chmod 755 {} \;
+        check_error
+        find "$JELLYFIN_CONFIG" -type f -exec chmod 644 {} \;
+        check_error
+        # Limpia partials viejos de rclone
+        find "$JELLYFIN_CONFIG" -name "*.partial" -delete || true
+        echo "Partials limpiados."
+    fi
+    
+    echo "Pre-clean completado. Ownership: $(ls -la "$DOCKER_DIR" | head -1)"
+else
+    echo "/home/tux/docker no existe aún. Se creará en el siguiente paso."
+fi
+
+# ========================================
+# FIX: Forzar ownership de /home/tux/docker como root (antes de su-tux) para subdirs existentes
+# ========================================
+if [ -d "$DOCKER_DIR" ]; then
+    echo "Detectado /home/tux/docker existente. Forzando ownership a tux:tux para evitar errores de permisos en subdirs (ej. jellyfin/config)..."
+    chown -R tux:tux "$DOCKER_DIR"
+    check_error
+    echo "Ownership corregido. Verificación: $(ls -la "$DOCKER_DIR" | head -1)"
 fi
 
 # ========================================
@@ -126,7 +175,7 @@ check_error
 echo "Configuración de sudoers aplicada."
 
 # ========================================
-# PASO PRINCIPAL: Configurar directorio, archivos y ejecutar compose como 'tux'
+# PASO PRINCIPAL: Configurar directorio, archivos como 'tux' (sin ejecutar compose aún)
 # ========================================
 echo "Ejecutando configuración de directorio y archivos como usuario 'tux'..."
 su - tux -c '
@@ -141,10 +190,13 @@ check_error() {
 }
 
 # ========================================
-# GRUPO 1: Crear directorio docker en /home/tux/ (como tux)
+# GRUPO 1: Crear directorio docker en /home/tux/ (como tux) y asignar permisos totales
 # ========================================
 echo "Creando directorio /home/tux/docker si no existe..."
 mkdir -p ~/docker
+check_error
+echo "Asignando permisos totales (755 recursivo) a /home/tux/docker y subdirectorios para usuario tux (usando sudo para forzar)..."
+sudo chmod -R 755 ~/docker
 check_error
 
 # ========================================
@@ -183,25 +235,24 @@ echo "$DOCKER_COMPOSE_CONFIG" > ~/docker/docker-compose.yml
 check_error
 echo "Archivo de configuración de docker-compose actualizado en ~/docker/docker-compose.yml"
 
-# ========================================
-# GRUPO 4: Ejecutar docker compose up -d en el directorio docker (como tux)
-# ========================================
-# Este grupo cambia al directorio ~/docker y ejecuta docker compose up -d para iniciar los servicios en background.
-# Usa sudo para permisos de Docker (asumiendo que tux no está en el grupo docker aún).
-echo "¿Deseas ejecutar docker compose up -d ahora? (y/n): "
-read -r RUN_COMPOSE
-if [[ "$RUN_COMPOSE" =~ ^[Yy]$ ]]; then
-    echo "Ejecutando docker compose up -d en ~/docker (reiniciará si hay cambios)..."
-    cd ~/docker
-    check_error
-    sudo docker compose up -d
-    check_error
-    echo "Servicios de Docker Compose iniciados/actualizados."
+# Re-asignar permisos después de escribir archivos en ~/docker (con sudo para forzar)
+sudo chmod -R 755 ~/docker
+check_error
+
+# VERIFICACIÓN: Chequea jellyfin/config
+if [ -d ~/docker/jellyfin/config ]; then
+    echo "Verificando ownership en ~/docker/jellyfin/config:"
+    ls -la ~/docker/jellyfin/config | head -3
+    if ! ls -la ~/docker/jellyfin/config | grep -q "tux.*tux"; then
+        echo "ERROR: Ownership no es tux:tux en jellyfin/config. Fijar manual."
+        exit 1
+    fi
+    echo "OK: Ownership correcto."
 else
-    echo "Omitiendo ejecución de docker compose up -d."
+    echo "Nota: jellyfin/config no existe aún (se creará en syncs)."
 fi
 
-echo "Configuración completada como usuario '\''tux'\''!"
+echo "Configuración de archivos completada como usuario '\''tux'\''!"
 '
 
 # Verificar si su falló
@@ -211,7 +262,21 @@ if [ $? -ne 0 ]; then
 fi
 
 # ========================================
-# PASO FINAL: Opcional - Agregar 'tux' al grupo docker para usar Docker sin sudo (como root)
+# FIX POST-SU: Re-forzar ownership como root después de escribir archivos
+# ========================================
+echo "Re-forzando ownership a tux:tux después de config de archivos..."
+chown -R tux:tux "$DOCKER_DIR"
+check_error
+
+# Post-final clean
+if [ -d "$JELLYFIN_CONFIG" ]; then
+    chown -R tux:tux "$JELLYFIN_CONFIG"
+    check_error
+    find "$JELLYFIN_CONFIG" -name "*.partial" -delete || true
+fi
+
+# ========================================
+# PASO OPCIONAL: Agregar 'tux' al grupo docker para usar Docker sin sudo (como root)
 # ========================================
 echo "¿Deseas agregar 'tux' al grupo docker para que pueda usar Docker sin sudo? (y/n): "
 read -r ADD_TO_DOCKER_GROUP
@@ -231,6 +296,37 @@ if [[ "$ADD_TO_DOCKER_GROUP" =~ ^[Yy]$ ]]; then
     fi
 else
     echo "No se agregó 'tux' al grupo docker. Puedes usar Docker con sudo."
+fi
+
+# ========================================
+# ÚLTIMO PASO: Ejecutar docker compose up -d en el directorio docker (como tux) - CONDICIONAL
+# ========================================
+# Este es el último paso: Pregunta si ejecutar, y si sí, lo hace como tux (usando sudo para evitar problemas de permisos/rel login)
+echo "¿Deseas ejecutar docker compose up -d ahora como usuario 'tux' en ~/docker? (y/n): "
+read -r RUN_COMPOSE
+if ! validate_yn "$RUN_COMPOSE"; then
+    exit 1
+fi
+
+if [[ "$RUN_COMPOSE" =~ ^[Yy]$ ]]; then
+    echo "Ejecutando docker compose up -d en ~/docker como 'tux' (reiniciará si hay cambios)..."
+    su - tux -c '
+    set -u
+    cd ~/docker
+    if [ $? -ne 0 ]; then
+        echo "ERROR: No se pudo cambiar al directorio ~/docker."
+        exit 1
+    fi
+    sudo docker compose up -d
+    if [ $? -ne 0 ]; then
+        echo "ERROR: docker compose up -d falló."
+        exit 1
+    fi
+    echo "Servicios de Docker Compose iniciados/actualizados exitosamente."
+    '
+    check_error  # Verifica el exit code del su -c
+else
+    echo "Omitiendo ejecución de docker compose up -d."
 fi
 
 echo "Script de setup finalizado. Ahora puedes conectarte como 'tux'."
